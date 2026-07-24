@@ -1,5 +1,5 @@
-// Thin entry point. Behavior branches on argv[0] inside run(), exactly like the
-// C original (which hard-links ssss-split -> ssss-combine).
+// Thin entry point; the split/combine behavior is chosen from the invoked
+// program name inside run().
 fn main() {
     ssss::run();
 }

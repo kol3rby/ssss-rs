@@ -1,12 +1,14 @@
-//! XTEA-based diffusion layer (ssss.c:330-396).
+//! XTEA-based diffusion layer.
 //!
-//! Pure `u32` arithmetic that must match the C to the bit. C relied on unsigned
-//! overflow; Rust makes it explicit with `wrapping_*`.
+//! Pure `u32` arithmetic with wrapping (overflowing) semantics, made explicit
+//! via `wrapping_*`. The public surface is just [`encode`] and [`decode`]; the
+//! direction flag and the per-block cipher stay internal (the latter as an
+//! `impl Fn` closure argument to [`encode_slice`]).
 
 use crate::field::Fe;
 
-/// `void encipher_block(uint32_t *v)` (ssss.c:332). 32 XTEA rounds.
-pub fn encipher_block(v: &mut [u32; 2]) {
+/// 32 XTEA rounds over a two-word block.
+fn encipher_block(v: &mut [u32; 2]) {
     let delta: u32 = 0x9E37_79B9;
     let mut sum: u32 = 0;
     for _ in 0..32 {
@@ -16,8 +18,8 @@ pub fn encipher_block(v: &mut [u32; 2]) {
     }
 }
 
-/// `void decipher_block(uint32_t *v)` (ssss.c:343). Inverse of the above.
-pub fn decipher_block(v: &mut [u32; 2]) {
+/// Inverse of [`encipher_block`].
+fn decipher_block(v: &mut [u32; 2]) {
     let delta: u32 = 0x9E37_79B9;
     let mut sum: u32 = 0xC6EF_3720;
     for _ in 0..32 {
@@ -27,10 +29,9 @@ pub fn decipher_block(v: &mut [u32; 2]) {
     }
 }
 
-/// `void encode_slice(uint8_t *data, int idx, int len, void (*process_block)())`
-/// (ssss.c:354). Reads two big-endian u32 words at wrapped offsets, applies the
-/// block function, writes them back.
-pub fn encode_slice(data: &mut [u8], idx: usize, len: usize, process: fn(&mut [u32; 2])) {
+/// Read two big-endian u32 words at wrapped offsets, apply the block function,
+/// and write them back.
+fn encode_slice(data: &mut [u8], idx: usize, len: usize, process: impl Fn(&mut [u32; 2])) {
     let mut v = [0u32; 2];
     for (i, vi) in v.iter_mut().enumerate() {
         *vi = (data[(idx + 4 * i) % len] as u32) << 24
@@ -47,35 +48,43 @@ pub fn encode_slice(data: &mut [u8], idx: usize, len: usize, process: fn(&mut [u
     }
 }
 
-/// `enum encdec {ENCODE, DECODE}` (ssss.c:373).
+/// Direction of the diffusion transform.
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub enum EncDec {
+enum EncDec {
     Encode,
     Decode,
 }
 
-/// `void encode_mpz(mpz_t x, enum encdec encdecmode)` (ssss.c:375).
-///
-/// `degree` replaces the global. 40 rounds over (degree/8) slices, forward for
-/// ENCODE and reverse for DECODE, with the `degree % 16 == 8` byte fixup that
-/// shuffles the extra buffer byte before and after the rounds.
-pub fn encode_mpz(x: &mut Fe, degree: u32, mode: EncDec) {
+/// Apply the diffusion layer in place.
+pub fn encode(x: &mut Fe, degree: u32) {
+    encode_mpz(x, degree, EncDec::Encode);
+}
+
+/// Undo the diffusion layer in place.
+pub fn decode(x: &mut Fe, degree: u32) {
+    encode_mpz(x, degree, EncDec::Decode);
+}
+
+/// 40 rounds over (degree/8) slices — forward for `Encode`, reverse for
+/// `Decode` — with the `degree % 16 == 8` byte fixup that shuffles the extra
+/// buffer byte before and after the rounds.
+fn encode_mpz(x: &mut Fe, degree: u32, mode: EncDec) {
     let deg = degree as usize;
     let vlen = (deg + 8) / 16 * 2;
     let mut v = vec![0u8; vlen];
 
-    // mpz_export(v, &t, -1, 2, 1, 0, x): little-endian 2-byte big-endian words.
+    // Serialize as little-endian 2-byte words, big-endian within each word.
     let (exp, _t) = x.export(-1, 2, 1);
     v[..exp.len()].copy_from_slice(&exp);
 
-    let dlen = deg / 8; // `len` argument to encode_slice
+    let dlen = deg / 8; // `len` (wrap modulus) passed to encode_slice
     if deg % 16 == 8 {
         v[dlen - 1] = v[dlen];
     }
 
     match mode {
         EncDec::Encode => {
-            // for (i = 0; i < 40 * (degree/8); i += 2)
+            // Forward: slices 0, 2, ... up to 40 * (degree/8).
             let mut i = 0usize;
             let end = 40 * dlen;
             while i < end {
@@ -84,7 +93,7 @@ pub fn encode_mpz(x: &mut Fe, degree: u32, mode: EncDec) {
             }
         }
         EncDec::Decode => {
-            // for (i = 40 * (degree/8) - 2; i >= 0; i -= 2)
+            // Reverse: the same slices in the opposite order.
             let mut i = 40 * dlen as i64 - 2;
             while i >= 0 {
                 encode_slice(&mut v, i as usize, dlen, decipher_block);
@@ -98,7 +107,7 @@ pub fn encode_mpz(x: &mut Fe, degree: u32, mode: EncDec) {
         v[dlen - 1] = 0;
     }
 
-    // mpz_import(x, (degree + 8) / 16, -1, 2, 1, 0, v)
+    // Deserialize with the same layout used above.
     *x = Fe::import(&v, (deg + 8) / 16, -1, 2, 1);
     debug_assert!(x.bits() <= deg);
 }
@@ -118,7 +127,7 @@ mod tests {
         assert_eq!(v, orig);
     }
 
-    // encode_mpz(ENCODE) then DECODE is the identity.
+    // encode() then decode() is the identity.
     #[test]
     fn encode_mpz_roundtrip() {
         let mut state: u64 = 0xdead_beef_cafe_babe;
@@ -146,9 +155,9 @@ mod tests {
                     continue;
                 }
                 let orig = x.clone();
-                encode_mpz(&mut x, deg, EncDec::Encode);
+                encode(&mut x, deg);
                 assert!(x.bits() <= deg as usize);
-                encode_mpz(&mut x, deg, EncDec::Decode);
+                decode(&mut x, deg);
                 assert_eq!(x, orig, "deg {} encode/decode not identity", deg);
             }
         }

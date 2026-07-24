@@ -1,23 +1,22 @@
-//! GF(2^deg) field arithmetic and field-element I/O (ssss.c:154-296).
+//! GF(2^deg) field arithmetic and field-element I/O.
 //!
-//! Backend (A): a field element (`Fe`) is an arbitrary-precision non-negative
-//! integer stored as little-endian bytes (`b[0]` = least significant byte).
-//! Every operation the C code performs via GMP `mpz_*` is reproduced here with
-//! identical bit-level semantics. In particular `Fe::export` / `Fe::import`
-//! mirror the `order` / `size` / `endian` arguments of `mpz_export` /
-//! `mpz_import` so the several different layouts the C uses line up exactly.
+//! A field element (`Fe`) is an arbitrary-precision non-negative integer stored
+//! as little-endian bytes (`b[0]` = least significant byte). `Fe::export` /
+//! `Fe::import` take explicit `order` / `size` / `endian` parameters so the
+//! several byte layouts used across the crate can be reproduced exactly.
 //!
-//! Naming: pure destination-arg free functions in C (`field_add(z,x,y)`) become
-//! value-returning functions/methods here — the language forbids the aliasing
-//! the out-parameter form relied on. Names are preserved; the `assert(z != y)`
-//! aliasing contract of `field_mult` is made unrepresentable by the API.
+//! Field addition and subtraction (both plain XOR in GF(2)) are one `impl Add
+//! for &Fe`; `Sub` is deliberately left unimplemented, making the sameness
+//! structural. Multiplication and inversion need the modulus, so they are
+//! `Field::mul` / `Field::invert` methods; the left-shift is `impl Shl<usize>`.
 
-use crate::errors::{warning, SssErrcode};
+use crate::errors::{warning, Error};
 use crate::secure::secure_zero;
 use std::io::Write;
+use std::ops::{Add, Shl};
 
-/// Coefficients of some irreducible polynomials over GF(2) (ssss.c:64-76).
-/// Copied verbatim: three coefficients per degree, for degrees 8, 16, ... 1024.
+/// Coefficients of an irreducible polynomial over GF(2) for each supported
+/// degree: three coefficients per degree, for degrees 8, 16, ... 1024.
 #[rustfmt::skip]
 pub(crate) static IRRED_COEFF: &[u8] = &[
     4,3,1,5,3,1,4,3,1,7,3,2,5,4,3,5,3,2,7,4,2,4,3,1,10,9,3,9,4,2,7,6,2,10,9,
@@ -33,13 +32,13 @@ pub(crate) static IRRED_COEFF: &[u8] = &[
     3,1,15,7,5,19,18,10,7,5,3,12,7,2,7,5,1,14,9,6,10,3,2,15,13,12,12,11,9,16,
     9,7,12,9,3,9,5,2,17,10,6,24,9,3,17,15,13,5,4,3,19,17,8,15,6,3,19,6,1 ];
 
-/// `int field_size_valid(int deg)` (ssss.c:156).
+/// Whether `deg` is a valid field size: a multiple of 8 in `8..=MAXDEGREE`.
 pub fn field_size_valid(deg: i32) -> bool {
     (8..=crate::MAXDEGREE).contains(&deg) && deg % 8 == 0
 }
 
-/// A GF(2^deg) field element: a non-negative bignum in little-endian bytes.
-/// Zeroed on `Drop` (the RAII replacement for GMP's `secure_free`/`secure_realloc`).
+/// A GF(2^deg) field element: a non-negative bignum in little-endian bytes,
+/// zeroed on `Drop`.
 #[derive(Clone, Default)]
 pub struct Fe {
     b: Vec<u8>,
@@ -50,9 +49,7 @@ impl PartialEq for Fe {
     // `[0x12]` and `[0x12, 0x00]` (the same integer) must compare equal.
     fn eq(&self, other: &Fe) -> bool {
         let n = self.b.len().max(other.b.len());
-        (0..n).all(|i| {
-            self.b.get(i).copied().unwrap_or(0) == other.b.get(i).copied().unwrap_or(0)
-        })
+        (0..n).all(|i| self.b.get(i).copied().unwrap_or(0) == other.b.get(i).copied().unwrap_or(0))
     }
 }
 impl Eq for Fe {}
@@ -71,35 +68,35 @@ impl std::fmt::Debug for Fe {
 }
 
 impl Fe {
-    /// The additive identity (mpz value 0).
+    /// The additive identity (value 0).
     pub fn zero() -> Fe {
         Fe { b: Vec::new() }
     }
 
-    /// `mpz_set_ui` for small values (used with 0, 1, and share indices).
+    /// A field element from a small integer (used with 0, 1, and share indices).
     pub fn from_u32(v: u32) -> Fe {
         Fe {
             b: v.to_le_bytes().to_vec(),
         }
     }
 
-    /// `mpz_cmp_ui(x, 0) == 0`.
+    /// Whether the value is 0.
     pub fn is_zero(&self) -> bool {
         self.b.iter().all(|&x| x == 0)
     }
 
-    /// True iff the value is exactly 1 (`mpz_cmp_ui(x, 1) == 0`).
+    /// Whether the value is exactly 1.
     pub fn is_one(&self) -> bool {
         self.b.first() == Some(&1) && self.b.iter().skip(1).all(|&x| x == 0)
     }
 
-    /// `mpz_tstbit(x, i)`.
+    /// Test bit `i`.
     pub fn bit(&self, i: usize) -> bool {
         let by = i / 8;
         by < self.b.len() && (self.b[by] >> (i % 8)) & 1 == 1
     }
 
-    /// `mpz_setbit(x, i)`.
+    /// Set bit `i`, growing the buffer as needed.
     pub fn setbit(&mut self, i: usize) {
         let by = i / 8;
         if by >= self.b.len() {
@@ -108,8 +105,7 @@ impl Fe {
         self.b[by] |= 1 << (i % 8);
     }
 
-    /// `mpz_sizeinbits`-style bit length: 0 for zero, else index of the highest
-    /// set bit plus one (equal to `mpz_sizeinbase(x, 2)` for nonzero x).
+    /// Bit length: 0 for zero, else the index of the highest set bit plus one.
     pub fn bits(&self) -> usize {
         for by in (0..self.b.len()).rev() {
             let v = self.b[by];
@@ -120,7 +116,7 @@ impl Fe {
         0
     }
 
-    /// `mpz_sizeinbase(x, 16)`: number of hex digits. GMP returns 1 for zero.
+    /// Number of hex digits needed to print the value (1 for zero).
     pub fn sizeinbase16(&self) -> usize {
         let bits = self.bits();
         if bits == 0 {
@@ -130,39 +126,8 @@ impl Fe {
         }
     }
 
-    /// `mpz_xor(z, x, y)` — this field's `field_add` and `field_sub`.
-    pub fn xor(x: &Fe, y: &Fe) -> Fe {
-        let n = x.b.len().max(y.b.len());
-        let mut b = vec![0u8; n];
-        for (i, out) in b.iter_mut().enumerate() {
-            let xb = x.b.get(i).copied().unwrap_or(0);
-            let yb = y.b.get(i).copied().unwrap_or(0);
-            *out = xb ^ yb;
-        }
-        Fe { b }
-    }
-
-    /// Left shift by `l` bits, i.e. multiply by 2^l (`mpz_mul_2exp`, the
-    /// `mpz_lshift` macro at ssss.c:131).
-    pub fn shl(&self, l: usize) -> Fe {
-        if self.is_zero() {
-            return Fe::zero();
-        }
-        let byte_shift = l / 8;
-        let bit_shift = l % 8;
-        let mut b = vec![0u8; self.b.len() + byte_shift + 1];
-        for (i, &src) in self.b.iter().enumerate() {
-            let v = (src as u16) << bit_shift;
-            b[i + byte_shift] |= v as u8;
-            b[i + byte_shift + 1] |= (v >> 8) as u8;
-        }
-        Fe { b }
-    }
-
-    /// Parse a hex string big-endian (`mpz_set_str(x, s, 16)`), returning an
-    /// error on any non-hex byte or on an empty string (both `-1` in GMP).
-    // The unit error mirrors GMP's `-1` sentinel; the caller maps it to the
-    // appropriate `SssErrcode`.
+    /// Parse a big-endian hex string, returning an error on any non-hex byte or
+    /// on an empty string.
     #[allow(clippy::result_unit_err)]
     pub fn from_hex(s: &[u8]) -> Result<Fe, ()> {
         if s.is_empty() {
@@ -188,7 +153,7 @@ impl Fe {
         Ok(Fe { b })
     }
 
-    /// `mpz_out_str(stream, 16, x)`: lowercase hex, no leading zeros, "0" for 0.
+    /// Lowercase hex, no leading zeros, "0" for 0.
     pub fn to_hex(&self) -> String {
         if self.is_zero() {
             return "0".to_string();
@@ -203,7 +168,7 @@ impl Fe {
         s
     }
 
-    /// Reproduce `mpz_export(out, &count, order, size, endian, 0, x)`.
+    /// Serialize the value into fixed-size words.
     ///
     /// * `order`  ==  1: most-significant word first; == -1: least first.
     /// * `size`:  bytes per word.
@@ -214,7 +179,11 @@ impl Fe {
     pub fn export(&self, order: i32, size: usize, endian: i32) -> (Vec<u8>, usize) {
         let bits = self.bits();
         let wordbits = size * 8;
-        let nwords = if bits == 0 { 0 } else { bits.div_ceil(wordbits) };
+        let nwords = if bits == 0 {
+            0
+        } else {
+            bits.div_ceil(wordbits)
+        };
         let mut le = self.b.clone();
         le.resize(nwords * size, 0);
         let mut out = vec![0u8; nwords * size];
@@ -233,8 +202,8 @@ impl Fe {
         (out, nwords)
     }
 
-    /// Reproduce `mpz_import(x, count, order, size, endian, 0, buf)` — the
-    /// inverse of `export` with the same argument meanings.
+    /// Deserialize `count` words back into a value — the inverse of `export`
+    /// with the same argument meanings.
     pub fn import(buf: &[u8], count: usize, order: i32, size: usize, endian: i32) -> Fe {
         let mut le = vec![0u8; count * size];
         for slot in 0..count {
@@ -252,19 +221,54 @@ impl Fe {
     }
 }
 
+/// Field addition (bitwise XOR). `Sub` is intentionally left unimplemented:
+/// subtraction *is* addition in GF(2).
+// Addition in GF(2^n) *is* XOR; the lint's "did you mean +?" suspicion is the
+// whole point of this impl.
+#[allow(clippy::suspicious_arithmetic_impl)]
+impl Add for &Fe {
+    type Output = Fe;
+    fn add(self, rhs: &Fe) -> Fe {
+        let n = self.b.len().max(rhs.b.len());
+        let mut b = vec![0u8; n];
+        for (i, out) in b.iter_mut().enumerate() {
+            let xb = self.b.get(i).copied().unwrap_or(0);
+            let yb = rhs.b.get(i).copied().unwrap_or(0);
+            *out = xb ^ yb;
+        }
+        Fe { b }
+    }
+}
+
+/// Left shift by `l` bits, i.e. multiply by 2^l.
+impl Shl<usize> for &Fe {
+    type Output = Fe;
+    fn shl(self, l: usize) -> Fe {
+        if self.is_zero() {
+            return Fe::zero();
+        }
+        let byte_shift = l / 8;
+        let bit_shift = l % 8;
+        let mut b = vec![0u8; self.b.len() + byte_shift + 1];
+        for (i, &src) in self.b.iter().enumerate() {
+            let v = (src as u16) << bit_shift;
+            b[i + byte_shift] |= v as u8;
+            b[i + byte_shift + 1] |= (v >> 8) as u8;
+        }
+        Fe { b }
+    }
+}
+
 /// A field context: the degree and the irreducible polynomial `poly`.
-/// Replaces the C globals `unsigned int degree` and `mpz_t poly`. A `None`
-/// `Ctx.field` corresponds to `degree == 0` (the "uninitialized" sentinel).
 pub struct Field {
     pub degree: u32,
     pub poly: Fe,
 }
 
 impl Field {
-    /// `void field_init(int deg)` (ssss.c:164). The `if (!degree)` guard is
-    /// enforced by the caller (`Ctx::field_init`) — it only builds a new
-    /// `Field` when none exists yet.
-    pub fn init(deg: i32) -> Field {
+    /// Build the field for a given degree, deriving `poly` from the irreducible-
+    /// coefficient table. The field drops with its owner; there is no teardown.
+    pub fn new(deg: i32) -> Field {
         assert!(field_size_valid(deg));
         let mut poly = Fe::zero();
         poly.setbit(deg as usize);
@@ -279,27 +283,26 @@ impl Field {
         }
     }
 
-    /// `void field_mult(mpz_t z, x, y)` (ssss.c:253). Carry-less multiply mod
-    /// `poly`. Returns z; the C `assert(z != y)` contract is structural here.
-    pub fn field_mult(&self, x: &Fe, y: &Fe) -> Fe {
+    /// Carry-less multiply of `x` and `y` reduced mod `poly`.
+    pub fn mul(&self, x: &Fe, y: &Fe) -> Fe {
         let mut b = x.clone();
         let mut z = if y.bit(0) { x.clone() } else { Fe::zero() };
         let deg = self.degree as usize;
         for i in 1..deg {
-            b = b.shl(1);
+            b = &b << 1;
             if b.bit(deg) {
-                b = Fe::xor(&b, &self.poly);
+                b = &b + &self.poly;
             }
             if y.bit(i) {
-                z = Fe::xor(&z, &b);
+                z = &z + &b;
             }
         }
         z
     }
 
-    /// `void field_invert(mpz_t z, x)` (ssss.c:273). Almost-inverse loop over
-    /// GF(2^deg). Asserts x != 0, as the C does.
-    pub fn field_invert(&self, x: &Fe) -> Fe {
+    /// Multiplicative inverse over GF(2^deg) via the almost-inverse loop.
+    /// Asserts x != 0.
+    pub fn invert(&self, x: &Fe) -> Fe {
         assert!(!x.is_zero());
         let mut u = x.clone();
         let mut v = self.poly.clone();
@@ -312,30 +315,29 @@ impl Field {
                 std::mem::swap(&mut z, &mut g);
                 i = -i;
             }
-            let h = v.shl(i as usize);
-            u = Fe::xor(&u, &h);
-            let h = g.shl(i as usize);
-            z = Fe::xor(&z, &h);
+            let h = &v << (i as usize);
+            u = &u + &h;
+            let h = &g << (i as usize);
+            z = &z + &h;
         }
         z
     }
 
-    /// `enum ssss_errcode field_import(mpz_t x, const char *s, int hexmode)`
-    /// (ssss.c:187). Returns the imported element or an error code. `s` is the
-    /// raw input bytes (so binary ASCII secrets round-trip like the C `char*`).
-    pub fn field_import(&self, s: &[u8], hexmode: bool) -> Result<Fe, SssErrcode> {
+    /// Import a field element from input bytes `s`, either hex or raw ASCII.
+    /// Returns the element or an error.
+    pub fn field_import(&self, s: &[u8], hexmode: bool) -> Result<Fe, Error> {
         let deg = self.degree as usize;
         if hexmode {
             if s.len() > deg / 4 {
-                return Err(SssErrcode::InputStringTooLong);
+                return Err(Error::InputStringTooLong);
             }
             if s.len() < deg / 4 {
                 warning("input string too short, adding null padding on the left");
             }
-            Fe::from_hex(s).map_err(|_| SssErrcode::InvalidSyntax)
+            Fe::from_hex(s).map_err(|_| Error::InvalidSyntax)
         } else {
             if s.len() > deg / 8 {
-                return Err(SssErrcode::InputStringTooLong);
+                return Err(Error::InputStringTooLong);
             }
             let warn = s.iter().any(|&c| !(32..127).contains(&c));
             if warn {
@@ -345,8 +347,8 @@ impl Field {
         }
     }
 
-    /// `void field_print(FILE *stream, const mpz_t x, int hexmode)`
-    /// (ssss.c:216).
+    /// Print a field element to `stream`: zero-padded hex, or ASCII with
+    /// non-printable bytes shown as '.'.
     pub fn field_print<W: Write>(&self, stream: &mut W, x: &Fe, hexmode: bool) {
         let deg = self.degree as usize;
         if hexmode {
@@ -357,7 +359,7 @@ impl Field {
             let _ = write!(stream, "{}", x.to_hex());
             let _ = writeln!(stream);
         } else {
-            // order=1, size=1: big-endian bytes, leading zero bytes dropped.
+            // Big-endian bytes, leading zero bytes dropped.
             let (mut buf, t) = x.export(1, 1, 0);
             let mut warn = false;
             for &byte in buf.iter().take(t) {
@@ -407,9 +409,9 @@ mod tests {
     fn shift_and_bits() {
         let one = Fe::from_u32(1);
         assert_eq!(one.bits(), 1);
-        assert_eq!(one.shl(10).bits(), 11);
-        assert!(one.shl(10).bit(10));
-        assert!(!one.shl(10).bit(9));
+        assert_eq!((&one << 10).bits(), 11);
+        assert!((&one << 10).bit(10));
+        assert!(!(&one << 10).bit(9));
         assert_eq!(Fe::zero().bits(), 0);
     }
 
@@ -424,7 +426,7 @@ mod tests {
             state
         };
         for &deg in &[8i32, 64, 128, 256, 1024] {
-            let field = Field::init(deg);
+            let field = Field::new(deg);
             for _ in 0..64 {
                 // build a random nonzero element with < deg bits
                 let mut x = Fe::zero();
@@ -442,8 +444,8 @@ mod tests {
                 if x.is_zero() {
                     x = Fe::from_u32(1);
                 }
-                let inv = field.field_invert(&x);
-                let prod = field.field_mult(&x, &inv);
+                let inv = field.invert(&x);
+                let prod = field.mul(&x, &inv);
                 assert!(prod.is_one(), "deg {} x*inv != 1", deg);
             }
         }
@@ -453,18 +455,18 @@ mod tests {
     fn add_is_xor_and_selfinverse() {
         let a = Fe::from_hex(b"cafe").unwrap();
         let b = Fe::from_hex(b"beef").unwrap();
-        let c = Fe::xor(&a, &b);
-        // field_sub == field_add: a + b + b == a
-        assert_eq!(Fe::xor(&c, &b), a);
+        let c = &a + &b;
+        // Addition is its own inverse in GF(2): a + b + b == a.
+        assert_eq!(&c + &b, a);
     }
 
     #[test]
     fn mult_identity_and_commute() {
-        let field = Field::init(128);
+        let field = Field::new(128);
         let one = Fe::from_u32(1);
         let x = Fe::from_hex(b"0123456789abcdef0123456789abcdef").unwrap();
-        assert_eq!(field.field_mult(&x, &one), x);
+        assert_eq!(field.mul(&x, &one), x);
         let y = Fe::from_hex(b"fedcba98").unwrap();
-        assert_eq!(field.field_mult(&x, &y), field.field_mult(&y, &x));
+        assert_eq!(field.mul(&x, &y), field.mul(&y, &x));
     }
 }

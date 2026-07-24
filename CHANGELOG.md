@@ -7,12 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned
+## [0.5.8] - 2026-07-24
 
-- Refactor the faithful port into more idiomatic Rust (RAII/`Drop` for lifecycle
-  pairs, return values over out-parameters, `Option` over sentinels,
-  operator-trait field arithmetic, a proper `Error` type), preserving the
-  byte-for-byte interop guarantee as the regression gate.
+Idiomatic-Rust release. Internally this refactors the faithful 0.5.7 port into
+more conventional Rust; the share wire format and combine behavior are unchanged.
+Shares stay mutually interchangeable with the C build, and the full test suite
+(field, diffusion, golden-file interop, and cross-combine) remains green
+byte-for-byte.
+
+### Changed
+
+- Collapsed `enum ssss_errcode` and its parallel `ssss_errmsg[]` table into a
+  single `Error` type whose messages live in a `Display` impl (implementing
+  `std::error::Error`); `fatal_errcode` dissolves into that `Display` plus the
+  one `fatal()` print site.
+- Expressed field arithmetic through operator traits: `impl Add`/`Shl` for
+  `&Fe` (with `Sub` deliberately unimplemented, since subtraction is addition in
+  GF(2)), and `field_mult`/`field_invert` as `Field::mul`/`Field::invert`.
+- Replaced the `_init`/`_deinit` pairs with constructors and `Drop`: `Cprng::open`
+  (fd closed on drop) and `Field::new` (reset via ownership); `cprng_deinit` and
+  `field_deinit` are gone.
+- Split the mutable `Ctx` god-struct into an immutable `Opts` (parsed once, with
+  `opt_` prefixes dropped and `-1`/`0` sentinels replaced by `Option`) plus the
+  transient run state.
+- Narrowed the diffusion layer's public surface to `encode`/`decode`, dropping
+  the `encdec` enum from the API and taking the block cipher as an `impl Fn`
+  closure instead of a raw function pointer.
 
 ## [0.5.7] - 2026-07-24
 
@@ -54,5 +74,6 @@ stream the two emit identical shares.
   thin `Makefile` (`make doc`) that generates `ssss.1` via `xmltoman`; `README`;
   GPLv2 `LICENSE`; `.gitignore`; and a Dependabot config for the crate.
 
-[Unreleased]: https://github.com/kol3rby/ssss-rs/compare/v0.5.7...HEAD
+[Unreleased]: https://github.com/kol3rby/ssss-rs/compare/v0.5.8...HEAD
+[0.5.8]: https://github.com/kol3rby/ssss-rs/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/kol3rby/ssss-rs/releases/tag/v0.5.7

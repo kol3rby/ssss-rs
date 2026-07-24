@@ -2,14 +2,11 @@
 //!
 //! * Self round-trip: `ssss-split` output combines back to the secret, with and
 //!   without `-x`, `-D`, `-w`, and across several `(t,n)` / `-s` values.
-//! * Golden vectors: exact share strings captured from the reference C build
-//!   (v0.5.7) run against a fixed random source, asserting byte-for-byte
-//!   identical generation.
+//! * Golden vectors: `ssss-split` output is asserted against fixed, known-good
+//!   share strings, pinning share generation byte-for-byte.
 //!
 //! Both use the `SSSS_RANDOM_SOURCE` hook to feed a deterministic byte stream:
-//! `fixed_random[i] = (i*37 + 11) & 0xff`. The reference vectors were produced
-//! by the C `ssss-split` reading that same file, so a match proves the port is
-//! byte-for-byte compatible on share generation.
+//! `fixed_random[i] = (i*37 + 11) & 0xff`, so generation is reproducible.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -62,7 +59,7 @@ fn combine(args: &[&str], shares: &str) -> String {
 
 #[test]
 fn golden_share_generation() {
-    // (secret, split args, expected exact stdout) captured from C ssss 0.5.7.
+    // (secret, split args, expected exact stdout).
     let cases: &[(&str, &[&str], &str)] = &[
         (
             "hello world",
@@ -175,7 +172,11 @@ fn run_status(bin: PathBuf, args: &[&str], input: &str) -> bool {
 fn duplicate_share_is_inconsistent() {
     // Combining the same share twice must fail (exit 1), not return garbage.
     assert!(
-        !run_status(combine_bin(), &["-t", "2", "-q"], "1-abcd1234\n1-abcd1234\n"),
+        !run_status(
+            combine_bin(),
+            &["-t", "2", "-q"],
+            "1-abcd1234\n1-abcd1234\n"
+        ),
         "duplicate share should fail"
     );
 }
@@ -183,5 +184,9 @@ fn duplicate_share_is_inconsistent() {
 #[test]
 fn invalid_share_syntax_fails() {
     // No '-' in the share => invalid syntax => exit 1.
-    assert!(!run_status(combine_bin(), &["-t", "2", "-q"], "noshare\nalsobad\n"));
+    assert!(!run_status(
+        combine_bin(),
+        &["-t", "2", "-q"],
+        "noshare\nalsobad\n"
+    ));
 }

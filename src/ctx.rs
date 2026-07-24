@@ -1,68 +1,78 @@
-//! The run-state context and the top-level operations (ssss.c:499-728).
+//! Command-line options, run-state context, and the top-level operations.
 //!
-//! The C globals (`opt_*`, `degree`, `poly`, `cprng`, `echo_orig`, `echo_off`)
-//! are gathered into a single `Ctx` threaded through the call graph — the main
-//! structural concession to Rust. Field names mirror the C globals.
+//! Configuration and run state are separated: `Opts` is the immutable
+//! configuration parsed once from the command line (absent values are `None`
+//! rather than sentinels), and `Ctx` is the transient run state — the effective
+//! security level derived at runtime, the lazily-built `Field`, and the terminal
+//! handles.
 
 use std::io::{Read, Write};
 
 use crate::cprng::Cprng;
-use crate::diffusion::{encode_mpz, EncDec};
-use crate::errors::{warning, SssErrcode};
+use crate::diffusion;
+use crate::errors::{warning, Error};
 use crate::field::{field_size_valid, Fe, Field};
 use crate::secure::secure_zero;
 use crate::shamir::{horner_r, restore_secret};
 use crate::{MAXDEGREE, MAXLINELEN};
 
-#[allow(non_snake_case)]
-pub struct Ctx {
-    pub opt_showversion: bool,
-    pub opt_help: bool,
-    pub opt_quiet: bool,
-    pub opt_QUIET: bool,
-    pub opt_hex: bool,
-    pub opt_diffusion: bool,
-    pub opt_security: i32,
-    pub opt_threshold: i32,
-    pub opt_number: i32,
-    pub opt_token: Option<String>,
-    pub opt_recovery: bool,
+/// Parsed command-line configuration. Set once during arg parsing, then
+/// read-only. Absent values are `None` rather than sentinels.
+#[derive(Default)]
+pub struct Opts {
+    pub show_version: bool,
+    pub help: bool,
+    pub quiet: bool,
+    pub very_quiet: bool,
+    pub hex: bool,
+    pub diffusion: bool,
+    pub recovery: bool,
+    /// `-s`: the requested security level; `None` selects a dynamic level.
+    pub security: Option<u32>,
+    /// `-t`: the reconstruction threshold.
+    pub threshold: Option<u32>,
+    /// `-n`: the number of shares to generate.
+    pub number: Option<u32>,
+    /// `-w`: an optional token prefix on every share.
+    pub token: Option<String>,
+}
 
-    /// `Some` <-> `degree != 0`; carries `degree` and `poly`.
+impl Opts {
+    /// Defaults: diffusion on, everything else off/unset.
+    pub fn new() -> Opts {
+        Opts {
+            diffusion: true,
+            ..Opts::default()
+        }
+    }
+}
+
+/// Transient run state: the immutable `Opts` plus the effective (possibly
+/// runtime-derived) security level, the lazily-initialized field, and the saved
+/// terminal modes.
+pub struct Ctx {
+    pub opts: Opts,
+    /// Effective security level: starts at `opts.security` and is filled in by
+    /// `ask_secret` when a dynamic level is derived from the secret's length.
+    pub security: Option<u32>,
+    /// `Some` carries the degree and polynomial; `None` means uninitialized.
     pub field: Option<Field>,
-    pub cprng: Cprng,
     pub echo_orig: libc::termios,
     pub echo_off: libc::termios,
 }
 
-impl Default for Ctx {
-    fn default() -> Ctx {
-        Ctx::new()
-    }
-}
-
 impl Ctx {
-    pub fn new() -> Ctx {
+    pub fn new(opts: Opts, echo_orig: libc::termios, echo_off: libc::termios) -> Ctx {
         Ctx {
-            opt_showversion: false,
-            opt_help: false,
-            opt_quiet: false,
-            opt_QUIET: false,
-            opt_hex: false,
-            opt_diffusion: true, // default 1
-            opt_security: 0,
-            opt_threshold: -1,
-            opt_number: -1,
-            opt_token: None,
-            opt_recovery: false,
+            security: opts.security,
+            opts,
             field: None,
-            cprng: Cprng::default(),
-            echo_orig: unsafe { std::mem::zeroed() },
-            echo_off: unsafe { std::mem::zeroed() },
+            echo_orig,
+            echo_off,
         }
     }
 
-    /// `degree` global accessor (0 when the field is uninitialized).
+    /// The field degree, or 0 when the field is uninitialized.
     pub fn degree(&self) -> u32 {
         self.field.as_ref().map(|f| f.degree).unwrap_or(0)
     }
@@ -71,16 +81,17 @@ impl Ctx {
         self.field.as_ref().expect("field not initialized")
     }
 
-    /// `void field_init(int deg)` (ssss.c:164) with the `if (!degree)` guard.
-    pub fn field_init(&mut self, deg: i32) {
-        if self.field.is_none() {
-            self.field = Some(Field::init(deg));
-        }
+    /// The reconstruction threshold, validated `>= 2` before any operation runs.
+    fn threshold(&self) -> usize {
+        self.opts.threshold.expect("threshold validated before use") as usize
     }
 
-    /// `void field_deinit(void)` (ssss.c:178): resets `degree` to 0.
-    pub fn field_deinit(&mut self) {
-        self.field = None;
+    /// Build the field once, on first use; later calls are no-ops. The field
+    /// lives in `self.field` and drops with the `Ctx`.
+    fn ensure_field(&mut self, deg: i32) {
+        if self.field.is_none() {
+            self.field = Some(Field::new(deg));
+        }
     }
 
     // --- terminal helpers ---
@@ -89,9 +100,8 @@ impl Ctx {
         unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
     }
 
-    /// `fgets(buf, sizeof(buf), stdin)` semantics over the shared, buffered
-    /// stdin: read up to MAXLINELEN-1 bytes, stopping after a newline. Returns
-    /// `None` only when nothing could be read before EOF (fgets -> NULL).
+    /// Read one line from stdin: up to MAXLINELEN-1 bytes, stopping after a
+    /// newline. Returns `None` only when nothing could be read before EOF.
     fn fgets_line(&self) -> Option<Vec<u8>> {
         let mut out: Vec<u8> = Vec::new();
         let stdin = std::io::stdin();
@@ -116,23 +126,20 @@ impl Ctx {
         }
     }
 
-    /// Truncate at the first '\r' or '\n' (`buf[strcspn(buf, "\r\n")] = '\0'`).
+    /// Truncate at the first '\r' or '\n'.
     fn strip_newline(buf: &mut Vec<u8>) {
         if let Some(pos) = buf.iter().position(|&c| c == b'\r' || c == b'\n') {
             buf.truncate(pos);
         }
     }
 
-    /// `enum ssss_errcode ask_secret(mpz_t secret)` (ssss.c:499).
-    pub fn ask_secret(&mut self) -> Result<Fe, SssErrcode> {
-        if !self.opt_quiet {
-            let deg = if self.opt_security != 0 {
-                self.opt_security
-            } else {
-                MAXDEGREE
-            };
+    /// Prompt for and read the secret, deriving a dynamic security level from
+    /// its length when none was requested, then apply the diffusion layer.
+    pub fn ask_secret(&mut self) -> Result<Fe, Error> {
+        if !self.opts.quiet {
+            let deg = self.security.map_or(MAXDEGREE, |s| s as i32);
             eprint!("Enter the secret, ");
-            if self.opt_hex {
+            if self.opts.hex {
                 eprint!("as most {} hex digits: ", deg / 4);
             } else {
                 eprint!("at most {} ASCII characters: ", deg / 8);
@@ -145,30 +152,33 @@ impl Ctx {
         let line = self.fgets_line();
         let mut buf = match line {
             Some(b) => b,
-            None => return Err(SssErrcode::IoReadingSecret),
+            None => return Err(Error::IoReadingSecret),
         };
-        // On success the C restores echo and prints a newline before parsing.
+        // Restore echo and print a newline before parsing.
         self.set_echo(&echo_orig);
         eprintln!();
         Self::strip_newline(&mut buf);
 
-        if self.opt_security == 0 {
-            self.opt_security = if self.opt_hex {
+        // Derive a dynamic security level from the secret length when unset.
+        if self.security.is_none() {
+            let derived = if self.opts.hex {
                 4 * ((buf.len() as i32 + 1) & !1)
             } else {
                 8 * buf.len() as i32
             };
-            if !field_size_valid(self.opt_security) {
+            if !field_size_valid(derived) {
                 secure_zero(&mut buf);
-                return Err(SssErrcode::InvalidSecurityLevel);
+                return Err(Error::InvalidSecurityLevel);
             }
-            if !self.opt_quiet {
-                eprintln!("Using a {} bit security level.", self.opt_security);
+            self.security = Some(derived as u32);
+            if !self.opts.quiet {
+                eprintln!("Using a {} bit security level.", derived);
             }
         }
 
-        self.field_init(self.opt_security);
-        let hex = self.opt_hex;
+        let sec = self.security.expect("security set above") as i32;
+        self.ensure_field(sec);
+        let hex = self.opts.hex;
         let import = self.field().field_import(&buf, hex);
         let mut secret = match import {
             Ok(s) => s,
@@ -178,9 +188,9 @@ impl Ctx {
             }
         };
 
-        if self.opt_diffusion {
+        if self.opts.diffusion {
             if self.degree() >= 64 {
-                encode_mpz(&mut secret, self.degree(), EncDec::Encode);
+                diffusion::encode(&mut secret, self.degree());
             } else {
                 warning("security level too small for the diffusion layer");
             }
@@ -190,10 +200,11 @@ impl Ctx {
         Ok(secret)
     }
 
-    /// `void calculate_shares_r(const mpz_t coeff_rev[])` (ssss.c:592).
+    /// Evaluate the polynomial at each share index and print the shares.
     pub fn calculate_shares_r(&self, coeff_rev: &[Fe]) {
+        let number = self.opts.number.unwrap_or(0);
         let mut fmt_len = 1usize;
-        let mut i = self.opt_number;
+        let mut i = number;
         while i >= 10 {
             i /= 10;
             fmt_len += 1;
@@ -201,10 +212,10 @@ impl Ctx {
         let field = self.field();
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        for i in 0..self.opt_number {
-            let x = Fe::from_u32((i + 1) as u32);
-            let y = horner_r(field, self.opt_threshold as usize, &x, coeff_rev);
-            if let Some(token) = &self.opt_token {
+        for i in 0..number {
+            let x = Fe::from_u32(i + 1);
+            let y = horner_r(field, self.threshold(), &x, coeff_rev);
+            if let Some(token) = &self.opts.token {
                 let _ = write!(out, "{}-", token);
             }
             let _ = write!(out, "{:0width$}-", i + 1, width = fmt_len);
@@ -212,16 +223,16 @@ impl Ctx {
         }
     }
 
-    /// `enum ssss_errcode ask_share(mpz_t x, mpz_t share, unsigned *s, int i)`
-    /// (ssss.c:615). Sets `*x` to the parsed index and returns the share.
-    pub fn ask_share(&mut self, x: &mut Fe, s: &mut u32, i: usize) -> Result<Fe, SssErrcode> {
-        if !self.opt_quiet {
-            eprint!("Share [{}/{}]: ", i + 1, self.opt_threshold);
+    /// Prompt for and parse one share. Sets `*x` to the parsed index, tracks the
+    /// shared security level in `*s`, and returns the share value.
+    pub fn ask_share(&mut self, x: &mut Fe, s: &mut u32, i: usize) -> Result<Fe, Error> {
+        if !self.opts.quiet {
+            eprint!("Share [{}/{}]: ", i + 1, self.threshold());
         }
 
         let mut buf = match self.fgets_line() {
             Some(b) => b,
-            None => return Err(SssErrcode::IoReadingShares),
+            None => return Err(Error::IoReadingShares),
         };
         Self::strip_newline(&mut buf);
 
@@ -231,7 +242,7 @@ impl Ctx {
             Some(p) => p,
             None => {
                 secure_zero(&mut buf);
-                return Err(SssErrcode::InvalidSyntax);
+                return Err(Error::InvalidSyntax);
             }
         };
         let value = buf[b_pos + 1..].to_vec();
@@ -245,18 +256,18 @@ impl Ctx {
             *s = 4 * value.len() as u32;
             if !field_size_valid(*s as i32) {
                 secure_zero(&mut buf);
-                return Err(SssErrcode::IllegalShareLength);
+                return Err(Error::IllegalShareLength);
             }
-            self.field_init(*s as i32);
+            self.ensure_field(*s as i32);
         } else if *s != 4 * value.len() as u32 {
             secure_zero(&mut buf);
-            return Err(SssErrcode::SharesDifferentSecurityLevels);
+            return Err(Error::SharesDifferentSecurityLevels);
         }
 
         let j = crate::atoi(&index_bytes);
         if j == 0 {
             secure_zero(&mut buf);
-            return Err(SssErrcode::InvalidShare);
+            return Err(Error::InvalidShare);
         }
 
         *x = Fe::from_u32(j as u32);
@@ -265,71 +276,59 @@ impl Ctx {
         import
     }
 
-    /// `enum ssss_errcode split(void)` (ssss.c:553).
-    pub fn split(&mut self) -> Result<(), SssErrcode> {
-        let r = self.split_inner();
-        self.field_deinit();
-        r
-    }
-
-    fn split_inner(&mut self) -> Result<(), SssErrcode> {
-        if !self.opt_quiet {
+    /// Generate the shares: read the secret, draw random coefficients, and
+    /// print each share.
+    pub fn split(&mut self) -> Result<(), Error> {
+        if !self.opts.quiet {
             eprint!(
                 "Generating shares using a ({},{}) scheme with ",
-                self.opt_threshold, self.opt_number
+                self.opts.threshold.expect("threshold validated"),
+                self.opts.number.expect("number validated"),
             );
-            if self.opt_security != 0 {
-                eprint!("a {} bit", self.opt_security);
-            } else {
-                eprint!("dynamic");
+            match self.security {
+                Some(s) => eprint!("a {} bit", s),
+                None => eprint!("dynamic"),
             }
             eprintln!(" security level.");
         }
 
-        let t = self.opt_threshold as usize;
+        let t = self.threshold();
         let mut coeff: Vec<Fe> = (0..t).map(|_| Fe::zero()).collect();
 
         coeff[t - 1] = self.ask_secret()?;
 
-        self.cprng.cprng_init()?;
+        // `cprng` opens here and closes on drop at the end of the block.
+        let mut cprng = Cprng::open()?;
         let degree = self.degree();
         for i in (0..t - 1).rev() {
-            match self.cprng.cprng_read(degree) {
-                Ok(v) => coeff[i] = v,
-                Err(e) => {
-                    return Err(e);
-                }
-            }
+            coeff[i] = cprng.read(degree)?;
         }
-        self.cprng.cprng_deinit()?;
+        drop(cprng);
 
         self.calculate_shares_r(&coeff);
         Ok(())
     }
 
-    /// `enum ssss_errcode combine(int with_secret)` (ssss.c:666).
-    pub fn combine(&mut self, with_secret: bool) -> Result<(), SssErrcode> {
-        let r = self.combine_inner(with_secret);
-        self.field_deinit();
-        r
-    }
-
-    fn combine_inner(&mut self, with_secret: bool) -> Result<(), SssErrcode> {
-        let t = self.opt_threshold as usize;
-        let mut a: Vec<Vec<Fe>> = (0..t).map(|_| (0..t).map(|_| Fe::zero()).collect()).collect();
+    /// Reconstruct the secret from shares. With `with_secret`, the secret is
+    /// read as the first share to regenerate the remaining shares (recovery).
+    pub fn combine(&mut self, with_secret: bool) -> Result<(), Error> {
+        let t = self.threshold();
+        let mut a: Vec<Vec<Fe>> = (0..t)
+            .map(|_| (0..t).map(|_| Fe::zero()).collect())
+            .collect();
         let mut y: Vec<Fe> = (0..t).map(|_| Fe::zero()).collect();
         let mut x = Fe::zero();
         let mut s: u32 = 0;
 
-        if !self.opt_quiet {
-            eprintln!("Enter {} shares separated by newlines:", self.opt_threshold);
+        if !self.opts.quiet {
+            eprintln!("Enter {} shares separated by newlines:", self.threshold());
         }
 
         for i in 0..t {
             if with_secret && i == 0 {
                 // For recovering purposes, treat the secret as a share.
                 y[i] = self.ask_secret()?;
-                s = self.opt_security as u32;
+                s = self.security.expect("security set by ask_secret");
                 x = Fe::from_u32(0);
             } else {
                 y[i] = self.ask_share(&mut x, &mut s, i)?;
@@ -338,35 +337,35 @@ impl Ctx {
             // Fill the Vandermonde column.
             a[t - 1][i] = Fe::from_u32(1);
             for j in (0..t - 1).rev() {
-                a[j][i] = self.field().field_mult(&a[j + 1][i], &x);
+                a[j][i] = self.field().mul(&a[j + 1][i], &x);
             }
-            // Remove the legacy x^k term (see comment at top of horner()).
-            x = self.field().field_mult(&x, &a[0][i]);
-            y[i] = Fe::xor(&y[i], &x);
+            // Remove the legacy x^k term that horner_r carries.
+            x = self.field().mul(&x, &a[0][i]);
+            y[i] = &y[i] + &x;
         }
 
-        if restore_secret(self.field(), t, &mut a, &mut y, self.opt_recovery) != 0 {
-            return Err(SssErrcode::InconsistentShares);
+        if restore_secret(self.field(), t, &mut a, &mut y, self.opts.recovery) != 0 {
+            return Err(Error::InconsistentShares);
         }
 
         if !with_secret {
             x = y[t - 1].clone();
-            if self.opt_diffusion {
+            if self.opts.diffusion {
                 if self.degree() >= 64 {
-                    encode_mpz(&mut x, self.degree(), EncDec::Decode);
+                    diffusion::decode(&mut x, self.degree());
                 } else {
                     warning("security level too small for the diffusion layer");
                 }
             }
-            if !self.opt_quiet {
+            if !self.opts.quiet {
                 eprint!("Resulting secret: ");
             }
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            let hex = self.opt_hex;
+            let hex = self.opts.hex;
             self.field().field_print(&mut out, &x, hex);
         }
-        if self.opt_recovery {
+        if self.opts.recovery {
             self.calculate_shares_r(&y);
         }
         Ok(())

@@ -5,7 +5,7 @@
 # ssss-split and ssss-combine binaries and installs the generated man page.
 rustPlatform.buildRustPackage {
   pname = "ssss";
-  version = "0.5.7";
+  version = "0.5.8";
 
   src = ./.;
 

@@ -46,7 +46,7 @@ gpg --keyserver keys.openpgp.org --recv-keys 0AEC8C5B
 # Now, clone the repo and verify the release tag:
 git clone https://github.com/kol3rby/ssss-rs.git
 cd ssss-rs
-git tag -v v0.5.7
+git tag -v v0.5.8
 
 # You should see output to the effect of:
 #   gpg: Signature made <date and time> using RSA key ID 0AEC8C5B
@@ -55,7 +55,7 @@ git tag -v v0.5.7
 # If you do NOT see a 'Good signature' from key ID 0AEC8C5B, do NOT proceed
 # with installation!
 #
-git checkout v0.5.7 # This will put you in 'detached HEAD' mode, which is fine
+git checkout v0.5.8 # This will put you in 'detached HEAD' mode, which is fine
                     # but don't make changes as you are no longer on a branch!
 # Proceed with the build steps from here. See INSTALL.md for details.
 ```
