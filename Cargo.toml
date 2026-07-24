@@ -1,0 +1,33 @@
+[package]
+name = "ssss"
+version = "0.5.7"
+edition = "2021"
+# ssss.c is licensed GPLv2 "or (at your option) any later version".
+license = "GPL-2.0-or-later"
+repository = "https://github.com/kol3rby/ssss-rs"
+# Rust reimplementation of B. Poettering / J. Frisby's `ssss` (v0.5.7):
+# a behaviorally identical, byte-for-byte compatible port of ssss.c.
+description = "A byte-for-byte compatible Rust port of ssss (Shamir's Secret Sharing Scheme)."
+
+[features]
+default = ["mlock"]
+# `mlock` mirrors the C build without -DNOMLOCK (memory locking + the -M flag).
+mlock = []
+
+[dependencies]
+libc = "0.2"
+
+[lib]
+name = "ssss"
+path = "src/lib.rs"
+
+# The original compiles once and hard-links ssss-split -> ssss-combine, then
+# branches on argv[0]. We build two binaries from the same run() entry point;
+# dispatch still keys on the invoked program name (see lib.rs / run()).
+[[bin]]
+name = "ssss-split"
+path = "src/bin/ssss-split.rs"
+
+[[bin]]
+name = "ssss-combine"
+path = "src/bin/ssss-combine.rs"

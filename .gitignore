@@ -1,0 +1,19 @@
+# Build products:
+#   In the C original these were the root-level /ssss-combine and /ssss-split
+#   binaries. Cargo builds everything (both binaries, the lib, and tests) into
+#   target/ instead.
+/target
+
+# Cargo.lock is intentionally NOT ignored: this crate ships binaries (an
+# application), so committing the lock file pins a reproducible dependency set.
+
+# Generated man pages:
+#   ssss.manpage.xml is the single source of truth; `make doc` generates ssss.1
+#   from it via xmltoman (and copies it to the per-tool names), exactly as the
+#   original build does. The generated files are artifacts, not committed.
+/ssss.1
+/ssss-combine.1
+/ssss-split.1
+
+# Generated HTML documentation:
+/ssss.1.html
